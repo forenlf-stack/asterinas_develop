@@ -1,0 +1,100 @@
+# 星绽内核 AIO 实现进度与待办
+## 已完成
+- 新增系统调用与分发表接入
+  
+  - io_setup 、 io_destroy 、 io_getevents 、 io_submit 、 io_cancel
+  - 分发表映射号位（x86_64）： 206–210
+  - 代码位置：
+    - kernel/src/syscall/aio.rs:10 sys_io_setup
+    - kernel/src/syscall/aio.rs:16 sys_io_destroy
+    - kernel/src/syscall/aio.rs:21 sys_io_submit
+    - kernel/src/syscall/aio.rs:33 sys_io_getevents
+    - kernel/src/syscall/aio.rs:51 sys_io_cancel
+    - kernel/src/syscall/arch/x86.rs:174 分发表宏入口（已添加 AIO 映射条目）
+- 内核 AIO 子系统
+  
+  - 上下文与注册表
+    - AioContext （容量、 pending 、 completed 、 WaitQueue ）
+    - 全局 AioRegistry （ id_alloc + contexts ）
+    - kernel/src/aio/mod.rs:71 AioRegistry ， kernel/src/aio/mod.rs:88 io_setup ， kernel/src/aio/mod.rs:98 io_destroy
+  - 请求解析与执行
+    - parse_iocb 按 Linux x86_64 ABI 解析字段（偏移）
+      - aio_data @ +0 、 aio_lio_opcode @ +16 、 aio_fildes @ +20
+      - aio_buf @ +24 、 aio_nbytes @ +32 、 aio_offset @ +40
+      - kernel/src/aio/mod.rs:264
+    - io_submit 支持 PREAD/PWRITE ，基于 workqueue 异步执行
+      - pwrite ：提交时拷入用户缓冲到内核缓冲，异步写入
+      - pread ：异步读取到内核缓冲， io_getevents 返回事件时拷回用户缓冲
+      - kernel/src/aio/mod.rs:106
+  - 事件获取与取消
+    - io_getevents ：阻塞等待（ WaitQueue + ManagedTimeout ），最多拷出 nr 个事件，并在 pread 时拷回数据
+      - kernel/src/aio/mod.rs:190
+    - io_cancel ：取消 pending 中的请求，生成 -ECANCELED 事件
+      - kernel/src/aio/mod.rs:244
+- 参数日志与诊断
+  
+  - 提交时打印请求参数（调试用，现设为 error 级别以便在低日志等级可见）
+    - kernel/src/syscall/aio.rs:21 、 kernel/src/aio/mod.rs:118
+## 验证结果
+- 用户态最小程序（libaio 兼容）验证输出：
+  - submitted=4 got=4 write_ok=2 read_ok=2 verify=[1,1]
+- AIO 参数日志（示例）：
+  - sys_io_submit: ctx=1, nr=4, iocbpp=0x...
+  - aio_submit: ctx=1, fd=3, opcode=Pwrite, nbytes=1048576, offset=0, buf=0x...
+  - 说明：
+    - 4 个请求均提交、完成并被 io_getevents 拉取
+    - 两次写入与两次读取均成功
+    - verify=[1,1] 表示两段读取数据校验均通过
+## 设计要点
+- I/O 调用链
+  - 用户态 io_submit → 内核 sys_io_submit → parse_iocb → io_submit → workqueue 异步执行
+  - FileLike::read_at/write_at 完成定位 I/O（ kernel/src/fs/file_handle.rs:38 、 49 ）
+- 阻塞与超时
+  - io_getevents 使用 WaitQueue 与 ManagedTimeout （ kernel/src/process/signal/pause.rs:76 ）实现阻塞与超时返回
+- 错误与边界
+  - 无效上下文： -EINVAL
+  - 队列容量不足： -EAGAIN
+  - 取消： -ECANCELED
+  - 非可寻址对象： -ESPIPE
+## 已知限制
+- 仅支持 iocb.aio_lio_opcode = 0(pread)/1(pwrite) ；其他 opcode 返回 -EINVAL
+- io_cancel 仅保证取消 pending 状态；运行中的请求为尽力取消
+- 未与块层 Bio/RequestQueue 做直通融合（当前通过文件抽象层执行）
+- 仅接入了 x86_64 分发表；其他架构未添加映射
+## 待完成
+- 扩展 opcode 支持
+  - IOCB_CMD_FSYNC 、 IOCB_CMD_PREADV / PWRITEV 、 IOCB_CMD_NOP 等
+- 块层融合与性能优化
+  - 与 kernel/comps/block 直通，减少上下文切换与拷贝
+  - 大块 I/O 的分片与并行提交策略
+- 完善取消语义
+  - 运行中请求的取消协议与设备协作
+- 跨架构支持
+  - 在 riscv64 、 loongarch64 的分发表添加 206–210 映射
+- 资源与安全
+  - 上下文与系统维度的并发/容量限额，防止 DoS
+  - 指针与页权限检查的覆盖度提升（现沿用 VmReader/VmWriter 校验）
+- 诊断与日志
+  - 将 AIO 日志降级为 info 并添加开关，避免刷屏
+## 建议的后续验证
+- fio 压测
+  - 读： fio --name=aio-read --filename=/ext2/tmp/aio.bin --size=128m --ioengine=libaio --rw=read --iodepth=64
+  - 写： fio --name=aio-write --filename=/ext2/tmp/aio.bin --size=128m --ioengine=libaio --rw=write --iodepth=64
+- 超时与取消
+  - 设置短 timespec 验证 io_getevents 超时返回
+  - 对未执行请求调用 io_cancel 验证取消事件（ res=-ECANCELED ）
+## 代码参考
+- 分发表宏入口： kernel/src/syscall/arch/x86.rs:174
+- 系统调用实现：
+  - kernel/src/syscall/aio.rs:10 sys_io_setup
+  - kernel/src/syscall/aio.rs:16 sys_io_destroy
+  - kernel/src/syscall/aio.rs:21 sys_io_submit
+  - kernel/src/syscall/aio.rs:33 sys_io_getevents
+  - kernel/src/syscall/aio.rs:51 sys_io_cancel
+- AIO 子系统：
+  - kernel/src/aio/mod.rs:88 io_setup
+  - kernel/src/aio/mod.rs:98 io_destroy
+  - kernel/src/aio/mod.rs:106 io_submit
+  - kernel/src/aio/mod.rs:190 io_getevents
+  - kernel/src/aio/mod.rs:244 io_cancel
+  - kernel/src/aio/mod.rs:264 parse_iocb （字段偏移）
