@@ -1,0 +1,13 @@
+修改makefile以运行测试集
+
+在anterinas中使用rust重写并实现异步I/O
+
+1.io_setup
+
+2.io_destory
+
+3.io_getevents
+
+4.io_submit
+
+5.io_cancel
